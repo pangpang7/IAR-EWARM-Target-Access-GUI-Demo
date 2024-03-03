@@ -1,0 +1,10 @@
+#pragma once
+
+const int TARGET_ACCESS_STATUS_OK                             = 0;
+const int TARGET_ACCESS_STATUS_SOCKET_ERROR                   = 1;
+const int TARGET_ACCESS_STATUS_WRONG_PACKET_TYPE              = 2;
+const int TARGET_ACCESS_STATUS_INVALID_ZONE_NAME              = 3;
+const int TARGET_ACCESS_STATUS_INVALID_PACKET_SIZE            = 4;
+const int TARGET_ACCESS_STATUS_WRONG_START_MARKER             = 5;
+const int TARGET_ACCESS_STATUS_MISSING_PACKET_LENGTH_FIELD    = 6;
+const int TARGET_ACCESS_STATUS_CLIENT_SERVER_VERSION_MISMATCH = 7;
