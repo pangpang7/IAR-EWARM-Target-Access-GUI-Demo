@@ -1,0 +1,930 @@
+/***************************************************************************
+**  This file is part of Serial Port Plotter                              **
+**                                                                        **
+**                                                                        **
+**  Serial Port Plotter is a program for plotting integer data from       **
+**  serial port using Qt and QCustomPlot                                  **
+**                                                                        **
+**  This program is free software: you can redistribute it and/or modify  **
+**  it under the terms of the GNU General Public License as published by  **
+**  the Free Software Foundation, either version 3 of the License, or     **
+**  (at your option) any later version.                                   **
+**                                                                        **
+**  This program is distributed in the hope that it will be useful,       **
+**  but WITHOUT ANY WARRANTY; without even the implied warranty of        **
+**  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         **
+**  GNU General Public License for more details.                          **
+**                                                                        **
+**  You should have received a copy of the GNU General Public License     **
+**  along with this program.  If not, see http://www.gnu.org/licenses/.   **
+**                                                                        **
+****************************************************************************
+**           Author: Borislav                                             **
+**           Contact: b.kereziev@gmail.com                                **
+**           Date: 29.12.14                                               **
+****************************************************************************/
+
+#include "mainwindow.hpp"
+#include "ui_mainwindow.h"
+//#include <x86intrin.h>
+#include "TargetAccessClientSDK.h"
+
+
+IARRemoteAccessThread::IARRemoteAccessThread()
+{
+    //::TargetAccessInitializeWithPort("localhost", 9931);
+}
+
+IARRemoteAccessThread::~IARRemoteAccessThread()
+{
+    ::TargetAccessShutdown();
+}
+
+void IARRemoteAccessThread::run()
+{
+    uint32_t addr;
+    //addr = 0x1fff823c,0x1fff8238
+    qDebug()<<"IARRemoteAccessThread is running"<<QThread::currentThread()<<endl;
+    while(1)
+    {
+        union {
+              uint32_t value;
+              uint8_t buffer[4];
+            } data;
+        QString str;
+        str.append("$");
+        foreach(QString var, _data_format_list)
+        {
+            //qDebug()<< var.toLatin1().data() << endl;
+            addr = var.toInt(nullptr,16);
+            ::TargetAccessReadTargetMemory(addr, data.buffer, sizeof(data.buffer));
+            //qDebug() << addr << ":" << data.value << endl;
+            QString tmpstr;
+            tmpstr.sprintf("%d ",data.value);
+            str.append(tmpstr);
+            //qDebug() << "rdata:" << rdata << endl;
+        }
+        str.chop(1);
+        str.append(";");
+        rdata = str.toUtf8();
+        emit IARreadyRead();
+        QThread::msleep(Int);
+    }
+}
+
+int IARRemoteAccessThread::open(QString IP, QString port, QString data_format, QString Int)
+{
+    QByteArray ba = IP.toLatin1();
+    ::TargetAccessInitializeWithPort(ba.data(), port.toInt());
+    this->Int = Int.toInt();
+    _data_format = data_format;
+    _data_format_list = _data_format.split(",");
+    foreach(QString var, _data_format_list)
+    {
+        qDebug()<< var.toLatin1().data() << endl;
+    }
+    return 0;
+}
+
+QByteArray IARRemoteAccessThread::readAll()
+{
+    return rdata;
+}
+
+/**
+ * @brief Constructor
+ * @param parent
+ */
+MainWindow::MainWindow (QWidget *parent) :
+  QMainWindow (parent),
+  ui (new Ui::MainWindow),
+
+  /* Populate colors */
+  line_colors{
+      /* For channel data (gruvbox palette) */
+      /* Light */
+      QColor ("#fb4934"),
+      QColor ("#b8bb26"),
+      QColor ("#fabd2f"),
+      QColor ("#83a598"),
+      QColor ("#d3869b"),
+      QColor ("#8ec07c"),
+      QColor ("#fe8019"),
+      /* Light */
+      QColor ("#cc241d"),
+      QColor ("#98971a"),
+      QColor ("#d79921"),
+      QColor ("#458588"),
+      QColor ("#b16286"),
+      QColor ("#689d6a"),
+      QColor ("#d65d0e"),
+   },
+  gui_colors {
+      /* Monochromatic for axes and ui */
+      QColor (48,  47,  47,  255), /**<  0: qdark ui dark/background color */
+      QColor (80,  80,  80,  255), /**<  1: qdark ui medium/grid color */
+      QColor (170, 170, 170, 255), /**<  2: qdark ui light/text color */
+      QColor (48,  47,  47,  200)  /**<  3: qdark ui dark/background color w/transparency */
+    },
+
+  /* Main vars */
+  connected (false),
+  plotting (false),
+  dataPointNumber (0),
+  channels(0),
+  serialPort (nullptr),
+  STATE (WAIT_START),
+  NUMBER_OF_POINTS (500)
+{
+  ui->setupUi (this);
+
+  /* Init UI and populate UI controls */
+  createUI();
+
+  /* Setup plot area and connect controls slots */
+  setupPlot();
+
+  /* Wheel over plot when plotting */
+  connect (ui->plot, SIGNAL (mouseWheel (QWheelEvent*)), this, SLOT (on_mouse_wheel_in_plot (QWheelEvent*)));
+
+  /* Slot for printing coordinates */
+  connect (ui->plot, SIGNAL (mouseMove (QMouseEvent*)), this, SLOT (onMouseMoveInPlot (QMouseEvent*)));
+
+  /* Channel selection */
+  connect (ui->plot, SIGNAL(selectionChangedByUser()), this, SLOT(channel_selection()));
+  connect (ui->plot, SIGNAL(legendDoubleClick (QCPLegend*, QCPAbstractLegendItem*, QMouseEvent*)), this, SLOT(legend_double_click (QCPLegend*, QCPAbstractLegendItem*, QMouseEvent*)));
+
+  /* Connect update timer to replot slot */
+  connect (&updateTimer, SIGNAL (timeout()), this, SLOT (replot()));
+
+  m_csvFile = nullptr;
+
+  myIARRemoteAccessThread = nullptr;
+
+  ui->lineEdit->setText("0x00000000");
+  ui->lineEdit_2->setText("9931");
+  ui->lineEdit_3->setText("localhost");
+  ui->lineEdit_4->setText("50");
+
+  qDebug("hello world!");
+}
+
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Destructor
+ */
+MainWindow::~MainWindow()
+{
+    closeCsvFile();
+      
+    if (serialPort != nullptr)
+      {
+        delete serialPort;
+      }
+
+    if (myIARRemoteAccessThread != nullptr)
+      {
+        myIARRemoteAccessThread->terminate();
+        myIARRemoteAccessThread->wait(100);
+        delete myIARRemoteAccessThread;
+      }
+    delete ui;
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Create remaining elements and populate the controls
+ */
+void MainWindow::createUI()
+{
+    /* Check if there are any ports at all; if not, disable controls and return */
+    if (QSerialPortInfo::availablePorts().size() == 0)
+      {
+        enable_com_controls (false);
+        ui->statusBar->showMessage ("No ports detected.");
+        ui->savePNGButton->setEnabled (false);
+        return;
+      }
+
+    /* Initialize the listwidget */
+    ui->listWidget_Channels->clear();
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Setup the plot area
+ */
+void MainWindow::setupPlot()
+{
+    /* Remove everything from the plot */
+    ui->plot->clearItems();
+
+    /* Background for the plot area */
+    ui->plot->setBackground (gui_colors[0]);
+
+    /* Used for higher performance (see QCustomPlot real time example) */
+    ui->plot->setNotAntialiasedElements (QCP::aeAll);
+    QFont font;
+    font.setStyleStrategy (QFont::NoAntialias);
+    ui->plot->legend->setFont (font);
+
+    /** See QCustomPlot examples / styled demo **/
+    /* X Axis: Style */
+    ui->plot->xAxis->grid()->setPen (QPen(gui_colors[2], 1, Qt::DotLine));
+    ui->plot->xAxis->grid()->setSubGridPen (QPen(gui_colors[1], 1, Qt::DotLine));
+    ui->plot->xAxis->grid()->setSubGridVisible (true);
+    ui->plot->xAxis->setBasePen (QPen (gui_colors[2]));
+    ui->plot->xAxis->setTickPen (QPen (gui_colors[2]));
+    ui->plot->xAxis->setSubTickPen (QPen (gui_colors[2]));
+    ui->plot->xAxis->setUpperEnding (QCPLineEnding::esSpikeArrow);
+    ui->plot->xAxis->setTickLabelColor (gui_colors[2]);
+    ui->plot->xAxis->setTickLabelFont (font);
+    /* Range */
+    ui->plot->xAxis->setRange (dataPointNumber - ui->spinPoints->value(), dataPointNumber);
+
+    /* Y Axis */
+    ui->plot->yAxis->grid()->setPen (QPen(gui_colors[2], 1, Qt::DotLine));
+    ui->plot->yAxis->grid()->setSubGridPen (QPen(gui_colors[1], 1, Qt::DotLine));
+    ui->plot->yAxis->grid()->setSubGridVisible (true);
+    ui->plot->yAxis->setBasePen (QPen (gui_colors[2]));
+    ui->plot->yAxis->setTickPen (QPen (gui_colors[2]));
+    ui->plot->yAxis->setSubTickPen (QPen (gui_colors[2]));
+    ui->plot->yAxis->setUpperEnding (QCPLineEnding::esSpikeArrow);
+    ui->plot->yAxis->setTickLabelColor (gui_colors[2]);
+    ui->plot->yAxis->setTickLabelFont (font);
+    /* Range */
+    //ui->plot->yAxis->setRange (ui->spinAxesMin->value(), ui->spinAxesMax->value());
+    /* User can change Y axis tick step with a spin box */
+    //ui->plot->yAxis->setAutoTickStep (false);
+    //ui->plot->yAxis->(ui->spinYStep->value());
+
+    /* User interactions Drag and Zoom are allowed only on X axis, Y is fixed manually by UI control */
+    ui->plot->setInteraction (QCP::iRangeDrag, true);
+    //ui->plot->setInteraction (QCP::iRangeZoom, true);
+    ui->plot->setInteraction (QCP::iSelectPlottables, true);
+    ui->plot->setInteraction (QCP::iSelectLegend, true);
+    ui->plot->axisRect()->setRangeDrag (Qt::Horizontal);
+    ui->plot->axisRect()->setRangeZoom (Qt::Horizontal);
+
+    /* Legend */
+    QFont legendFont;
+    legendFont.setPointSize (9);
+    ui->plot->legend->setVisible (true);
+    ui->plot->legend->setFont (legendFont);
+    ui->plot->legend->setBrush (gui_colors[3]);
+    ui->plot->legend->setBorderPen (gui_colors[2]);
+    /* By default, the legend is in the inset layout of the main axis rect. So this is how we access it to change legend placement */
+    ui->plot->axisRect()->insetLayout()->setInsetAlignment (0, Qt::AlignTop|Qt::AlignRight);
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Enable/disable COM controls
+ * @param enable true enable, false disable
+ */
+void MainWindow::enable_com_controls (bool enable)
+{
+
+  /* Toolbar elements */
+  ui->actionConnect->setEnabled (enable);
+  ui->actionPause_Plot->setEnabled (!enable);
+  ui->actionDisconnect->setEnabled (!enable);
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Open the inside serial port; connect its signals
+ * @param portInfo
+ * @param baudRate
+ * @param dataBits
+ * @param parity
+ * @param stopBits
+ */
+void MainWindow::openPort (QSerialPortInfo portInfo, int baudRate, QSerialPort::DataBits dataBits, QSerialPort::Parity parity, QSerialPort::StopBits stopBits)
+{
+    serialPort = new QSerialPort(portInfo, nullptr);                                            // Create a new serial port
+    myIARRemoteAccessThread = new IARRemoteAccessThread();
+
+    connect (this, SIGNAL(portOpenOK()), this, SLOT(portOpenedSuccess()));                 // Connect port signals to GUI slots
+    connect (this, SIGNAL(portOpenFail()), this, SLOT(portOpenedFail()));
+    connect (this, SIGNAL(portClosed()), this, SLOT(onPortClosed()));
+    connect (this, SIGNAL(newData(QStringList)), this, SLOT(onNewDataArrived(QStringList)));
+    connect (serialPort, SIGNAL(readyRead()), this, SLOT(readData()));
+    connect (myIARRemoteAccessThread, SIGNAL(IARreadyRead()), this, SLOT(readData()));
+    
+    connect (this, SIGNAL(newData(QStringList)), this, SLOT(saveStream(QStringList)));
+
+    /*if (serialPort->open (QIODevice::ReadWrite))
+      {
+        serialPort->setBaudRate (baudRate);
+        serialPort->setParity (parity);
+        serialPort->setDataBits (dataBits);
+        serialPort->setStopBits (stopBits);
+        emit portOpenOK();
+      }
+    else
+      {
+        emit portOpenedFail();
+        qDebug() << serialPort->errorString();
+      }*/
+
+    myIARRemoteAccessThread->open(ui->lineEdit_3->text(),ui->lineEdit_2->text(),ui->lineEdit->text(),ui->lineEdit_4->text());
+    myIARRemoteAccessThread->start();
+    emit portOpenOK();
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Slot for closing the port
+ */
+void MainWindow::onPortClosed()
+{
+    //qDebug() << "Port closed signal received!";
+    updateTimer.stop();
+    connected = false;
+    plotting = false;
+    
+    //--
+    closeCsvFile();
+    disconnect (myIARRemoteAccessThread, SIGNAL(IARreadyRead()), this, SLOT(readData()));
+    disconnect (serialPort, SIGNAL(readyRead()), this, SLOT(readData()));
+    disconnect (this, SIGNAL(portOpenOK()), this, SLOT(portOpenedSuccess()));             // Disconnect port signals to GUI slots
+    disconnect (this, SIGNAL(portOpenFail()), this, SLOT(portOpenedFail()));
+    disconnect (this, SIGNAL(portClosed()), this, SLOT(onPortClosed()));
+    disconnect (this, SIGNAL(newData(QStringList)), this, SLOT(onNewDataArrived(QStringList)));
+  
+    disconnect (this, SIGNAL(newData(QStringList)), this, SLOT(saveStream(QStringList)));
+
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Port Combo Box index changed slot; displays info for selected port when combo box is changed
+ * @param arg1
+ */
+void MainWindow::on_comboPort_currentIndexChanged (const QString &arg1)
+{
+    QSerialPortInfo selectedPort (arg1);                                                   // Dislplay info for selected port
+    ui->statusBar->showMessage (selectedPort.description());
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Slot for port opened successfully
+ */
+void MainWindow::portOpenedSuccess()
+{
+    //qDebug() << "Port opened signal received!";
+    setupPlot();                                                                          // Create the QCustomPlot area
+    ui->statusBar->showMessage ("Connected!");
+    enable_com_controls (false);                                                                // Disable controls if port is open
+    
+    if(ui->actionRecord_stream->isChecked())
+    {
+        //--> Create new CSV file with current date/timestamp
+        openCsvFile();
+    }
+    /* Lock the save option while recording */
+    ui->actionRecord_stream->setEnabled(false);
+
+    updateTimer.start (20);                                                                // Slot is refreshed 20 times per second
+    connected = true;                                                                      // Set flags
+    plotting = true;
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Slot for fail to open the port
+ */
+void MainWindow::portOpenedFail()
+{
+    //qDebug() << "Port cannot be open signal received!";
+    ui->statusBar->showMessage ("Cannot open port!");
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Replot
+ */
+void MainWindow::replot()
+{
+  ui->plot->xAxis->setRange (dataPointNumber - ui->spinPoints->value(), dataPointNumber);
+  ui->plot->replot();
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Slot for new data from serial port . Data is comming in QStringList and needs to be parsed
+ * @param newData
+ */
+void MainWindow::onNewDataArrived(QStringList newData)
+{
+    static int data_members = 0;
+    static int channel = 0;
+    static int i = 0;
+    volatile bool you_shall_NOT_PASS = false;
+
+    /* When a fast baud rate is set (921kbps was the first to starts to bug),
+       this method is called multiple times (2x in the 921k tests), so a flag
+       is used to throttle
+       TO-DO: Separate processes, buffer data (1) and process data (2) */
+    while (you_shall_NOT_PASS) {}
+    you_shall_NOT_PASS = true;
+
+    if (plotting)
+      {
+        /* Get size of received list */
+        data_members = newData.size();
+
+        /* Parse data */
+        for (i = 0; i < data_members; i++)
+          {
+            /* Update number of axes if needed */
+            while (ui->plot->plottableCount() <= channel)
+              {
+                /* Add new channel data */
+                ui->plot->addGraph();
+                ui->plot->graph()->setPen (line_colors[channels % CUSTOM_LINE_COLORS]);
+                ui->plot->graph()->setName (QString("Channel %1").arg(channels));
+                if(ui->plot->legend->item(channels))
+                {
+                    ui->plot->legend->item (channels)->setTextColor (line_colors[channels % CUSTOM_LINE_COLORS]);
+                }
+                ui->listWidget_Channels->addItem(ui->plot->graph()->name());
+                ui->listWidget_Channels->item(channel)->setForeground(QBrush(line_colors[channels % CUSTOM_LINE_COLORS]));
+                channels++;
+              }
+
+            /* [TODO] Method selection and plotting */
+            /* X-Y */
+            if (0)
+              {
+
+              }
+            /* Rolling (v1.0.0 compatible) */
+            else
+              {
+                /* Add data to Graph 0 */
+                ui->plot->graph(channel)->addData (dataPointNumber, newData[channel].toDouble());
+                /* Increment data number and channel */
+                channel++;
+              }
+          }
+
+        /* Post-parsing */
+        /* X-Y */
+        if (0)
+          {
+
+          }
+        /* Rolling (v1.0.0 compatible) */
+        else
+          {
+            dataPointNumber++;
+            channel = 0;
+          }
+      }
+    you_shall_NOT_PASS = false;
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Slot for spin box for plot minimum value on y axis
+ * @param arg1
+ */
+void MainWindow::on_spinAxesMin_valueChanged(int arg1)
+{
+    ui->plot->yAxis->setRangeLower (arg1);
+    ui->plot->replot();
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Slot for spin box for plot maximum value on y axis
+ * @param arg1
+ */
+void MainWindow::on_spinAxesMax_valueChanged(int arg1)
+{
+    ui->plot->yAxis->setRangeUpper (arg1);
+    ui->plot->replot();
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Read data for inside serial port
+ */
+void MainWindow::readData()
+{
+    //qDebug() << "void MainWindow::readData() enter" << endl;
+    //if(serialPort->bytesAvailable()) {                                                    // If any bytes are available
+    if(1) {
+        //QByteArray data = serialPort->readAll();                                          // Read all data in QByteArray
+        QByteArray data = myIARRemoteAccessThread->readAll();
+        //qDebug() << data[0] << data[1] << data[2] << data[3] << data[4] << data[5] << endl;
+
+        if(!data.isEmpty()) {                                                             // If the byte array is not empty
+            char *temp = data.data();                                                     // Get a '\0'-terminated char* to the data
+
+            if (!filterDisplayedData){
+                ui->textEdit_UartWindow->append(data);
+            }
+            for(int i = 0; temp[i] != '\0'; i++) {                                        // Iterate over the char*
+                switch(STATE) {                                                           // Switch the current state of the message
+                case WAIT_START:                                                          // If waiting for start [$], examine each char
+                    if(temp[i] == START_MSG) {                                            // If the char is $, change STATE to IN_MESSAGE
+                        STATE = IN_MESSAGE;
+                        receivedData.clear();                                             // Clear temporary QString that holds the message
+                        break;                                                            // Break out of the switch
+                    }
+                    break;
+                case IN_MESSAGE:                                                          // If state is IN_MESSAGE
+                    if(temp[i] == END_MSG) {                                              // If char examined is ;, switch state to END_MSG
+                        STATE = WAIT_START;
+                        QStringList incomingData = receivedData.split(' ');               // Split string received from port and put it into list
+                        if(filterDisplayedData){
+                            ui->textEdit_UartWindow->append(receivedData);
+                        }
+                        //qDebug() << "emit newData(incomingData)" << endl;
+                        emit newData(incomingData);                                       // Emit signal for data received with the list
+                        break;
+                    }
+                    else if (isdigit (temp[i]) || isspace (temp[i]) || temp[i] =='-' || temp[i] =='.')
+                      {
+                        /* If examined char is a digit, and not '$' or ';', append it to temporary string */
+                        receivedData.append(temp[i]);
+                      }
+                    break;
+                default: break;
+                }
+            }
+        }
+    }
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Number of axes combo; when changed, display axes colors in status bar
+ * @param index
+ */
+//void MainWindow::on_comboAxes_currentIndexChanged(int index)
+//{
+//    if(index == 0) {
+//      ui->statusBar->showMessage("Axis 1: Red");
+//    } else if(index == 1) {
+//        ui->statusBar->showMessage("Axis 1: Red; Axis 2: Yellow");
+//    } else {
+//        ui->statusBar->showMessage("Axis 1: Red; Axis 2: Yellow; Axis 3: Green");
+//    }
+//}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Spin box for changing the Y Tick step
+ * @param arg1
+ */
+void MainWindow::on_spinYStep_valueChanged(int arg1)
+{
+    ui->plot->yAxis->ticker()->setTickCount(arg1);
+    ui->plot->replot();
+    ui->spinYStep->setValue(ui->plot->yAxis->ticker()->tickCount());
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Save a PNG image of the plot to current EXE directory
+ */
+void MainWindow::on_savePNGButton_clicked()
+{
+    ui->plot->savePng (QString::number(dataPointNumber) + ".png", 1920, 1080, 2, 50);
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Prints coordinates of mouse pointer in status bar on mouse release
+ * @param event
+ */
+void MainWindow::onMouseMoveInPlot(QMouseEvent *event)
+{
+    int xx = int(ui->plot->xAxis->pixelToCoord(event->x()));
+    int yy = int(ui->plot->yAxis->pixelToCoord(event->y()));
+    QString coordinates("X: %1 Y: %2");
+    coordinates = coordinates.arg(xx).arg(yy);
+    ui->statusBar->showMessage(coordinates);
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Send plot wheelmouse to spinbox
+ * @param event
+ */
+void MainWindow::on_mouse_wheel_in_plot (QWheelEvent *event)
+{
+  QWheelEvent inverted_event = QWheelEvent(event->posF(), event->globalPosF(),
+                                           -event->pixelDelta(), -event->angleDelta(),
+                                           0, Qt::Vertical, event->buttons(), event->modifiers());
+  QApplication::sendEvent (ui->spinPoints, &inverted_event);
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Select both line and legend (channel)
+ * @param plottable
+ * @param event
+ */
+void MainWindow::channel_selection (void)
+{
+    /* synchronize selection of graphs with selection of corresponding legend items */
+     for (int i = 0; i < ui->plot->graphCount(); i++)
+       {
+         QCPGraph *graph = ui->plot->graph(i);
+         QCPPlottableLegendItem *item = ui->plot->legend->itemWithPlottable (graph);
+         if (item->selected())
+           {
+             item->setSelected (true);
+   //          graph->set (true);
+           }
+         else
+           {
+             item->setSelected (false);
+     //        graph->setSelected (false);
+           }
+       }
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Rename a graph by double clicking on its legend item
+ * @param legend
+ * @param item
+ */
+void MainWindow::legend_double_click(QCPLegend *legend, QCPAbstractLegendItem *item, QMouseEvent *event)
+{
+    Q_UNUSED (legend)
+    Q_UNUSED(event)
+    /* Only react if item was clicked (user could have clicked on border padding of legend where there is no item, then item is 0) */
+    if (item)
+      {
+        QCPPlottableLegendItem *plItem = qobject_cast<QCPPlottableLegendItem*>(item);
+        bool ok;
+        QString newName = QInputDialog::getText (this, "Change channel name", "New name:", QLineEdit::Normal, plItem->plottable()->name(), &ok, Qt::Popup);
+        if (ok)
+          {
+            plItem->plottable()->setName(newName);
+            for(int i=0; i<ui->plot->graphCount(); i++)
+            {
+                ui->listWidget_Channels->item(i)->setText(ui->plot->graph(i)->name());
+            }
+            ui->plot->replot();
+          }
+      }
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Spin box controls how many data points are collected and displayed
+ * @param arg1
+ */
+void MainWindow::on_spinPoints_valueChanged (int arg1)
+{
+    Q_UNUSED(arg1)
+    ui->plot->xAxis->setRange (dataPointNumber - ui->spinPoints->value(), dataPointNumber);
+    ui->plot->replot();
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Shows a window with instructions
+ */
+void MainWindow::on_actionHow_to_use_triggered()
+{
+  helpWindow = new HelpWindow (this);
+  helpWindow->setWindowTitle ("How to use this application");
+  helpWindow->show();
+}
+
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Connects to COM port or restarts plotting
+ */
+void MainWindow::on_actionConnect_triggered()
+{
+  if (connected)
+    {
+      /* Is connected, restart if paused */
+      if (!plotting)
+        {                                                                              // Start plotting
+          updateTimer.start();                                                              // Start updating plot timer
+          plotting = true;
+          ui->actionConnect->setEnabled (false);
+          ui->actionPause_Plot->setEnabled (true);
+          ui->statusBar->showMessage ("Plot restarted!");
+        }
+    }
+  else
+    {
+      QSerialPortInfo portInfo;
+      int baudRate;
+      QSerialPort::DataBits dataBits;
+      QSerialPort::Parity parity;
+      QSerialPort::StopBits stopBits;
+      /* Open serial port and connect its signals */
+      openPort (portInfo, baudRate, dataBits, parity, stopBits);
+  }
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Keep COM port open but pause plotting
+ */
+void MainWindow::on_actionPause_Plot_triggered()
+{
+  if (plotting)
+    {
+      updateTimer.stop();                                                               // Stop updating plot timer
+      plotting = false;
+      ui->actionConnect->setEnabled (true);
+      ui->actionPause_Plot->setEnabled (false);
+      ui->statusBar->showMessage ("Plot paused, new data will be ignored");
+    }
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Keep COM port open but pause plotting
+ */
+void MainWindow::on_actionRecord_stream_triggered()
+{
+    if (ui->actionRecord_stream->isChecked())
+    {
+      ui->statusBar->showMessage ("Data will be stored in csv file");
+    }
+    else
+    {
+      ui->statusBar->showMessage ("Data will not be stored anymore");
+    }
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Closes COM port and stop plotting
+ */
+void MainWindow::on_actionDisconnect_triggered()
+{
+  if (connected)
+    {
+      serialPort->close();                                                              // Close serial port
+      emit portClosed();                                                                // Notify application
+      delete serialPort;                                                                // Delete the pointer
+      serialPort = nullptr;                                                                // Assign NULL to dangling pointer
+      myIARRemoteAccessThread->terminate();
+      myIARRemoteAccessThread->wait(100);
+      delete myIARRemoteAccessThread;
+      myIARRemoteAccessThread = nullptr;
+      ui->statusBar->showMessage ("Disconnected!");
+
+      connected = false;                                                                // Set connected status flag to false
+      ui->actionConnect->setEnabled (true);
+
+      plotting = false;                                                                 // Not plotting anymore
+      ui->actionPause_Plot->setEnabled (false);
+      ui->actionDisconnect->setEnabled (false);
+      ui->actionRecord_stream->setEnabled(true);
+      receivedData.clear();                                                             // Clear received string
+
+      ui->savePNGButton->setEnabled (false);
+      enable_com_controls (true);
+    }
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Clear all channels data and reset plot area
+ *
+ * This function will not delete the channel itself (legend will stay)
+ */
+void MainWindow::on_actionClear_triggered()
+{
+    ui->plot->clearPlottables();
+    ui->listWidget_Channels->clear();
+    channels = 0;
+    dataPointNumber = 0;
+    emit setupPlot();
+    ui->plot->replot();
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Open a new CSV file to save received data
+ *
+ */
+void MainWindow::openCsvFile(void)
+{
+  m_csvFile = new QFile(QDateTime::currentDateTime().toString("yyyy-MM-d-HH-mm-ss-")+"data-out.csv");
+  if(!m_csvFile)
+      return;
+  if (!m_csvFile->open(QIODevice::ReadWrite | QIODevice::Text))
+        return;
+  
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Open a new CSV file to save received data
+ *
+ */
+void MainWindow::closeCsvFile(void)
+{
+  if(!m_csvFile) return;
+  m_csvFile->close();
+  if(m_csvFile) delete m_csvFile;
+  m_csvFile = nullptr;
+}
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+/**
+ * @brief Open a new CSV file to save received data
+ *
+ */
+void MainWindow::saveStream(QStringList newData)
+{
+  if(!m_csvFile)
+    return;
+  if(ui->actionRecord_stream->isChecked())
+  {
+      QTextStream out(m_csvFile);
+      foreach (const QString &str, newData) {
+        out << str << ",";
+      }
+      out << "\n";
+  }
+}
+
+/** ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+
+void MainWindow::on_pushButton_TextEditHide_clicked()
+{
+    if(ui->pushButton_TextEditHide->isChecked())
+    {
+        ui->textEdit_UartWindow->setVisible(false);
+        ui->pushButton_TextEditHide->setText("Show TextBox");
+    }
+    else
+    {
+        ui->textEdit_UartWindow->setVisible(true);
+        ui->pushButton_TextEditHide->setText("Hide TextBox");
+    }
+}
+
+void MainWindow::on_pushButton_ShowallData_clicked()
+{
+    if(ui->pushButton_ShowallData->isChecked())
+    {
+        filterDisplayedData = false;
+        ui->pushButton_ShowallData->setText("Filter Incoming Data");
+    }
+    else
+    {
+        filterDisplayedData = true;
+        ui->pushButton_ShowallData->setText("Show All Incoming Data");
+    }
+}
+
+void MainWindow::on_pushButton_AutoScale_clicked()
+{
+    ui->plot->yAxis->rescale(true);
+    ui->spinAxesMax->setValue(int(ui->plot->yAxis->range().upper) + int(ui->plot->yAxis->range().upper*0.1));
+    ui->spinAxesMin->setValue(int(ui->plot->yAxis->range().lower) + int(ui->plot->yAxis->range().lower*0.1));
+}
+
+void MainWindow::on_pushButton_ResetVisible_clicked()
+{
+    for(int i=0; i<ui->plot->graphCount(); i++)
+    {
+        ui->plot->graph(i)->setVisible(true);
+        ui->listWidget_Channels->item(i)->setBackground(Qt::NoBrush);
+    }
+}
+
+void MainWindow::on_listWidget_Channels_itemDoubleClicked(QListWidgetItem *item)
+{
+    int graphIdx = ui->listWidget_Channels->currentRow();
+
+    if(ui->plot->graph(graphIdx)->visible())
+    {
+        ui->plot->graph(graphIdx)->setVisible(false);
+        item->setBackgroundColor(Qt::black);
+    }
+    else
+    {
+        ui->plot->graph(graphIdx)->setVisible(true);
+        item->setBackground(Qt::NoBrush);
+    }
+    ui->plot->replot();
+}
+
+void MainWindow::on_pushButton_clicked()
+{
+
+}
