@@ -10,4 +10,4 @@ IAR target access mechanism:
 ![image](https://github.com/pangpang7/IAR-EWARM-Target-Access-GUI-Demo/blob/main/IAR%20Target%20Access.png)
 
 Target Access Demo:
-
+![image](https://github.com/pangpang7/IAR-EWARM-Target-Access-GUI-Demo/blob/main/DEMO.gif)
