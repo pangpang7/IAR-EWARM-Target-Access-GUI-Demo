@@ -56,7 +56,7 @@ void IARRemoteAccessThread::run()
         foreach(QString var, _data_format_list)
         {
             //qDebug()<< var.toLatin1().data() << endl;
-            addr = var.toInt(nullptr,16);
+            addr = var.toUInt(nullptr,16);
             ::TargetAccessReadTargetMemory(addr, data.buffer, sizeof(data.buffer));
             //qDebug() << addr << ":" << data.value << endl;
             QString tmpstr;
